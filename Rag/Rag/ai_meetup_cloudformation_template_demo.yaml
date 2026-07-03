@@ -1,0 +1,213 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Parameters:
+  VpcId:
+    Description: The ID of the VPC
+    Type: AWS::EC2::VPC::Id
+  KnowledgeBaseId:
+    Description: The ID of the Knowledge Base
+    Type: String
+  ModelId:
+    Description: The ID of the Model
+    Type: String
+Resources:
+  MyEC2Instance:
+    Type: 'AWS::EC2::Instance'
+    DependsOn:
+      - MyRestApi
+      - MyStage
+    Properties:
+      ImageId: ami-0cf2b4e024cdb6960 # Updated AMI ID
+      InstanceType: t2.micro
+      SecurityGroupIds:
+        - !Ref MySecurityGroup
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash
+          echo 'installing dependencies'
+          sudo apt update
+          sudo apt-get update
+          sudo apt upgrade -y
+          sudo apt install git curl unzip tar make sudo vim wget -y
+          sudo apt install python3-pip -y
+          echo 'creating app.py'
+          echo 'import streamlit as st
+          import requests
+          import os
+  
+          st.set_page_config(page_title="AI Assistant using RAG")
+  
+          new_title = "<p style=\"font-family:sans-serif; color:Green; font-size: 42px;\">AI Assistant using RAG 🎯</p>"
+          st.markdown(new_title, unsafe_allow_html=True)
+  
+          input_text = st.text_area("Input text", label_visibility="collapsed")
+          go_button = st.button("Submit", type="primary")
+          api_url = "https://${MyRestApi}.execute-api.${AWS::Region}.amazonaws.com/${MyStage}/myresource"
+  
+          if go_button:
+              with st.spinner("Processing..."):
+                  print("API URL: " + api_url)
+                  response = requests.get(api_url, params={"prompt": input_text})
+                  print("API Response: " + str(response))
+                  if response.status_code == 200:
+                      st.write(response.json()["body"])
+                  else:
+                      print("API request failed with status code " + str(response.status_code))
+                      st.error("API request failed with status code " + str(response.status_code))' > /home/ubuntu/app.py
+          echo 'streamlit' > /home/ubuntu/requirements.txt
+          echo 'installing streamlit'
+          sudo -u ubuntu pip3 install -r /home/ubuntu/requirements.txt --break-system-packages
+          export API_URL=https://${MyRestApi}.execute-api.${AWS::Region}.amazonaws.com/${MyStage}
+          echo 'API_URL: ' $API_URL
+          echo 'export API_URL=https://${MyRestApi}.execute-api.${AWS::Region}.amazonaws.com/${MyStage}' >> /home/ubuntu/.bashrc
+          source /home/ubuntu/.bashrc
+          sudo -u ubuntu nohup python3 -m streamlit run /home/ubuntu/app.py > /home/ubuntu/log_file 2>&1 &
+          echo 'streamlit app running'
+
+  MySecurityGroup:
+    Type: 'AWS::EC2::SecurityGroup'
+    Properties:
+      VpcId: !Ref VpcId
+      GroupDescription: Security Group for EC2 instance
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 8501
+          ToPort: 8501
+          CidrIp: 0.0.0.0/0
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 0.0.0.0/0
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: 0.0.0.0/0 # Added SSH port
+      SecurityGroupEgress:
+        - IpProtocol: '-1'
+          CidrIp: 0.0.0.0/0 # Allow all outbound traffic
+
+  MyLambdaFunction:
+    Type: 'AWS::Lambda::Function'
+    Properties:
+      Handler: index.handler
+      Role: !GetAtt 'LambdaExecutionRole.Arn'
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import os
+  
+          client_bedrock_knowledgebase = boto3.client('bedrock-agent-runtime')
+  
+          def handler(event, context):
+              print(event['prompt'])
+              user_prompt = event['prompt']
+              client_knowledgebase = client_bedrock_knowledgebase.retrieve_and_generate(
+                  input={
+                      'text': user_prompt
+                  },
+                  retrieveAndGenerateConfiguration={
+                      'type': 'KNOWLEDGE_BASE',
+                      'knowledgeBaseConfiguration': {
+                        'knowledgeBaseId': os.environ['KnowledgeBaseId'],
+                        'modelArn': 'arn:aws:bedrock:us-west-2::foundation-model/' + os.environ['ModelId']
+                      }
+                  }
+              )
+              response_kbase_final = client_knowledgebase['output']['text']
+              return {
+                  'statusCode': 200,
+                  'body': response_kbase_final
+              }
+      Runtime: python3.8
+      Timeout: 60
+      Environment:
+        Variables:
+          KnowledgeBaseId: !Ref KnowledgeBaseId
+          ModelId: !Ref ModelId
+
+  LambdaExecutionRole:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action:
+              - 'sts:AssumeRole'
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonBedrockFullAccess
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole # Added AWSLambdaBasicExecutionRole
+
+  MyRestApi:
+    Type: 'AWS::ApiGateway::RestApi'
+    Properties:
+      Name: MyRestApi
+
+  MyResource:
+    Type: 'AWS::ApiGateway::Resource'
+    Properties:
+      RestApiId: !Ref MyRestApi
+      ParentId: !GetAtt
+        - MyRestApi
+        - RootResourceId
+      PathPart: myresource
+
+  MyGetMethod:
+    Type: 'AWS::ApiGateway::Method'
+    Properties:
+      RestApiId: !Ref MyRestApi
+      ResourceId: !Ref MyResource
+      HttpMethod: GET
+      AuthorizationType: NONE
+      RequestParameters:
+        method.request.querystring.prompt: true # Added query string parameter "prompt"
+      Integration:
+        Type: AWS
+        IntegrationHttpMethod: POST
+        Uri: !Sub
+          - 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${Arn}/invocations'
+          - Arn: !GetAtt 'MyLambdaFunction.Arn'
+        IntegrationResponses:
+          - StatusCode: 200
+        RequestTemplates:
+          application/json: '{"prompt":"$input.params(''prompt'')"}'
+      MethodResponses:
+        - StatusCode: 200
+          ResponseModels:
+            application/json: 'Empty'
+  MyDeployment:
+    Type: 'AWS::ApiGateway::Deployment'
+    DependsOn: MyGetMethod
+    Properties:
+      RestApiId: !Ref MyRestApi
+      Description: 'Deployment for MyRestApi'
+      StageName: 'prod'
+
+  MyStage:
+    Type: 'AWS::ApiGateway::Stage'
+    Properties:
+      RestApiId: !Ref MyRestApi
+      DeploymentId: !Ref MyDeployment
+      StageName: 'unique-prod'
+  MyLambdaInvokePermission:
+    Type: 'AWS::Lambda::Permission'
+    Properties:
+      FunctionName: !GetAtt MyLambdaFunction.Arn
+      Action: 'lambda:InvokeFunction'
+      Principal: 'apigateway.amazonaws.com'
+      SourceArn: !Sub
+        - 'arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${ApiId}/*'
+        - ApiId: !Ref MyRestApi
+Outputs:
+  MyEC2InstanceURL:
+    Description: The URL of the EC2 instance
+    Value: !Sub
+      - 'http://${PublicIp}:8501'
+      - PublicIp: !GetAtt MyEC2Instance.PublicIp
